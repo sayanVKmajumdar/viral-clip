@@ -4,6 +4,8 @@ import subprocess
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from analyzer import resolve_cookies_file, ytdlp_base_args
+
 CACHE_DIR = Path("/var/tmp/viralclip_cache")
 JOBS_DIR = Path("/var/tmp/viralclip_jobs")
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
@@ -52,30 +54,40 @@ def ensure_source_video(info: Dict[str, Any]) -> Optional[Path]:
             "bv*[vcodec^=avc1][height<=720][fps<=30][filesize<350M]+ba[acodec^=mp4a]/"
             "bv*[vcodec^=avc1][height<=480][fps<=30]+ba[acodec^=mp4a]/"
             "bv*[vcodec^=avc1][height<=720][fps<=30]+ba[acodec^=mp4a]/"
-            "b[height<=480][ext=mp4]/b[height<=720]"
+            "b[height<=480][ext=mp4]/b[height<=720][ext=mp4]/b[ext=mp4]/b"
         )
     else:
-        fmt = "bv*[vcodec^=avc1][height<=720]+ba[acodec^=mp4a]/bv*[height<=720]+ba/b[height<=720][ext=mp4]/b[height<=720]"
+        fmt = (
+            "bv*[vcodec^=avc1][height<=720]+ba[acodec^=mp4a]/"
+            "bv*[height<=720]+ba/b[height<=720][ext=mp4]/b[height<=720]/b[ext=mp4]/b"
+        )
 
-    cmd = [
-        "yt-dlp",
-        "--js-runtimes", "node:/usr/bin/node",
-        "-f", fmt,
-        "--merge-output-format", "mp4",
-        "-o", tmp_tmpl,
-        "--no-playlist",
-        "--no-warnings",
-        info["_canonical_url"],
-    ]
-    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-    # Clean any partial files if download failed
-    for part in CACHE_DIR.glob(f"{vid}*.part"):
-        try:
-            part.unlink()
-        except OSError:
-            pass
-    if proc.returncode == 0 and out_path.exists() and out_path.stat().st_size > 10_000:
-        return out_path
+    has_cookies = resolve_cookies_file() is not None
+    tried: List[Optional[str]] = [info.get("_player_client")]
+    for fb in ("android_vr", "android"):
+        if fb not in tried:
+            tried.append(fb)
+
+    for client in tried:
+        use_cookies = has_cookies and client not in ("android_vr", "android", "ios")
+        cmd = [
+            *ytdlp_base_args(player_client=client, allow_cookies=use_cookies),
+            "-f", fmt,
+            "--merge-output-format", "mp4",
+            "-o", tmp_tmpl,
+            "--no-playlist",
+            "--no-warnings",
+            info["_canonical_url"],
+        ]
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        # Clean any partial files if download failed
+        for part in CACHE_DIR.glob(f"{vid}*.part"):
+            try:
+                part.unlink()
+            except OSError:
+                pass
+        if proc.returncode == 0 and out_path.exists() and out_path.stat().st_size > 10_000:
+            return out_path
     return None
 
 
@@ -257,19 +269,29 @@ def render_clip(
 
     if not use_local:
         # Download just this <60s section for huge >45min videos
-        sec_cmd = [
-            "yt-dlp",
-            "--js-runtimes", "node:/usr/bin/node",
-            "-f", "bv*[vcodec^=avc1][height<=720]+ba[acodec^=mp4a]/b[height<=720][ext=mp4]/b[height<=720]",
-            "--download-sections", f"*{start:.2f}-{end:.2f}",
-            "-o", str(raw_seg),
-            "--no-playlist",
-            "--no-warnings",
-            info["_canonical_url"],
-        ]
-        p_dl = subprocess.run(sec_cmd, capture_output=True, text=True, timeout=120)
-        if p_dl.returncode != 0 or not raw_seg.exists():
-            raise RuntimeError(f"Failed downloading clip segment: {p_dl.stderr[:240]}")
+        has_cookies = resolve_cookies_file() is not None
+        tried: List[Optional[str]] = [info.get("_player_client")]
+        for fb in ("android_vr", "android"):
+            if fb not in tried:
+                tried.append(fb)
+        last_sec_err = ""
+        for client in tried:
+            use_cookies = has_cookies and client not in ("android_vr", "android", "ios")
+            sec_cmd = [
+                *ytdlp_base_args(player_client=client, allow_cookies=use_cookies),
+                "-f", "bv*[vcodec^=avc1][height<=720]+ba[acodec^=mp4a]/b[height<=720][ext=mp4]/b[height<=720]/b[ext=mp4]/b",
+                "--download-sections", f"*{start:.2f}-{end:.2f}",
+                "-o", str(raw_seg),
+                "--no-playlist",
+                "--no-warnings",
+                info["_canonical_url"],
+            ]
+            p_dl = subprocess.run(sec_cmd, capture_output=True, text=True, timeout=120)
+            if p_dl.returncode == 0 and raw_seg.exists():
+                break
+            last_sec_err = p_dl.stderr
+        if not raw_seg.exists():
+            raise RuntimeError(f"Failed downloading clip segment: {last_sec_err[:240]}")
         input_path = raw_seg
         seek_args: List[str] = []
     else:
