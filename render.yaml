@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: viralclip-studio
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /api/health
+    autoDeploy: true
+    envVars:
+      - key: PORT
+        value: 10000
