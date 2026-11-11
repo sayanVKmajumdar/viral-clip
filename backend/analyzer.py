@@ -1,4 +1,5 @@
 import array
+import base64
 import html
 import json
 import math
@@ -14,6 +15,66 @@ import httpx
 
 CACHE_DIR = Path("/var/tmp/viralclip_cache")
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
+COOKIES_PATH = CACHE_DIR / "_yt_cookies.txt"
+
+
+def resolve_cookies_file() -> Optional[Path]:
+    """Return path to YouTube Netscape cookies file from env vars if configured."""
+    env_file = os.environ.get("YT_COOKIES_FILE", "").strip()
+    if env_file and Path(env_file).is_file():
+        return Path(env_file)
+
+    raw_b64 = os.environ.get("YT_COOKIES_B64", "").strip()
+    raw_txt = os.environ.get("YT_COOKIES_TXT", "").strip()
+
+    content = ""
+    if raw_b64:
+        try:
+            content = base64.b64decode(raw_b64).decode("utf-8", errors="ignore").strip()
+        except Exception:
+            content = ""
+    elif raw_txt:
+        if "\n" not in raw_txt and "\\n" in raw_txt:
+            raw_txt = raw_txt.replace("\\n", "\n")
+        content = raw_txt.strip()
+
+    if content:
+        if not content.startswith("#"):
+            content = "# Netscape HTTP Cookie File\n" + content
+        COOKIES_PATH.write_text(content + "\n", encoding="utf-8")
+        try:
+            os.chmod(COOKIES_PATH, 0o600)
+        except OSError:
+            pass
+        return COOKIES_PATH
+
+    if COOKIES_PATH.is_file() and COOKIES_PATH.stat().st_size > 20:
+        return COOKIES_PATH
+    return None
+
+
+def ytdlp_base_args(player_client: Optional[str] = None, allow_cookies: bool = True) -> List[str]:
+    args: List[str] = ["yt-dlp", "--js-runtimes", "node:/usr/bin/node"]
+    cookies_file = resolve_cookies_file() if allow_cookies else None
+    if cookies_file:
+        args.extend(["--cookies", str(cookies_file)])
+    if player_client:
+        args.extend(["--extractor-args", f"youtube:player_client={player_client}"])
+    return args
+
+
+def _is_bot_or_client_error(stderr: str) -> bool:
+    low = (stderr or "").lower()
+    return any(
+        k in low
+        for k in (
+            "sign in to confirm",
+            "not a bot",
+            "page needs to be reloaded",
+            "http error 403",
+            "requested format is not available",
+        )
+    )
 
 STOPWORDS = {
     "the", "a", "an", "and", "or", "but", "if", "then", "else", "when", "where",
@@ -138,23 +199,44 @@ def extract_youtube_id(url: str) -> str:
 def fetch_video_info(url: str) -> Dict[str, Any]:
     vid = extract_youtube_id(url)
     canonical_url = f"https://www.youtube.com/watch?v={vid}"
-    cmd = [
-        "yt-dlp",
-        "--js-runtimes", "node:/usr/bin/node",
-        "--dump-single-json",
-        "--no-download",
-        "--no-playlist",
-        "--no-warnings",
-        canonical_url,
-    ]
-    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=45)
-    if proc.returncode != 0 or not proc.stdout.strip():
-        err = (proc.stderr or "Failed to fetch YouTube video info").strip()
-        raise RuntimeError(f"Could not access YouTube video: {err[:280]}")
-    data = json.loads(proc.stdout)
-    data["_canonical_url"] = canonical_url
-    data["_video_id"] = vid
-    return data
+
+    has_cookies = resolve_cookies_file() is not None
+    # Try default client first (preserves heatmap & 720p+), then fall back to mobile/VR clients on datacenter bot checks
+    clients: List[Optional[str]] = (
+        [None, "web", "tv", "android_vr", "android"]
+        if has_cookies
+        else [None, "android_vr", "android", "tv_simply", "ios"]
+    )
+
+    last_err = "Failed to fetch YouTube video info"
+    for client in clients:
+        use_cookies = has_cookies and client not in ("android_vr", "android", "ios")
+        cmd = [
+            *ytdlp_base_args(player_client=client, allow_cookies=use_cookies),
+            "--dump-single-json",
+            "--no-download",
+            "--no-playlist",
+            "--no-warnings",
+            canonical_url,
+        ]
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=45)
+        if proc.returncode == 0 and proc.stdout.strip():
+            data = json.loads(proc.stdout)
+            data["_canonical_url"] = canonical_url
+            data["_video_id"] = vid
+            data["_player_client"] = client
+            return data
+        last_err = (proc.stderr or last_err).strip()
+        if not _is_bot_or_client_error(last_err):
+            break
+
+    if "sign in to confirm" in last_err.lower() or "not a bot" in last_err.lower():
+        raise RuntimeError(
+            "YouTube blocked this cloud server IP ('Sign in to confirm you're not a bot'). "
+            "Fix: Add YT_COOKIES_TXT (or YT_COOKIES_B64) to your Render Environment Variables and redeploy, "
+            "or run locally / on Hugging Face."
+        )
+    raise RuntimeError(f"Could not access YouTube video: {last_err[:280]}")
 
 
 def _clean_text(t: str) -> str:
@@ -402,7 +484,8 @@ def fetch_transcript(
 
     if track_spec:
         try:
-            with httpx.Client(timeout=20.0, follow_redirects=True) as client:
+            headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/130.0.0.0 Safari/537.36"}
+            with httpx.Client(timeout=20.0, follow_redirects=True, headers=headers) as client:
                 if kind == "both":
                     urls = json.loads(track_spec)
                     r_man = client.get(urls["manual"]).json()
@@ -488,18 +571,26 @@ def download_audio_for_analysis(info: Dict[str, Any]) -> Optional[Path]:
     audio_file = CACHE_DIR / f"{vid}_audio.m4a"
     if audio_file.exists() and audio_file.stat().st_size > 1024:
         return audio_file
-    cmd = [
-        "yt-dlp",
-        "--js-runtimes", "node:/usr/bin/node",
-        "-f", "ba[acodec^=mp4a]/ba[ext=m4a]/ba",
-        "-o", str(audio_file),
-        "--no-playlist",
-        "--no-warnings",
-        info["_canonical_url"],
-    ]
-    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
-    if proc.returncode == 0 and audio_file.exists():
-        return audio_file
+
+    has_cookies = resolve_cookies_file() is not None
+    tried: List[Optional[str]] = [info.get("_player_client")]
+    for fb in ("android_vr", "android"):
+        if fb not in tried:
+            tried.append(fb)
+
+    for client in tried:
+        use_cookies = has_cookies and client not in ("android_vr", "android", "ios")
+        cmd = [
+            *ytdlp_base_args(player_client=client, allow_cookies=use_cookies),
+            "-f", "ba[acodec^=mp4a]/ba[ext=m4a]/ba/b[ext=mp4]/b",
+            "-o", str(audio_file),
+            "--no-playlist",
+            "--no-warnings",
+            info["_canonical_url"],
+        ]
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+        if proc.returncode == 0 and audio_file.exists() and audio_file.stat().st_size > 1024:
+            return audio_file
     return None
 
 
